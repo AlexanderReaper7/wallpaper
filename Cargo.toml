@@ -1,0 +1,20 @@
+[package]
+name = "wallpaper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytemuck = { version = "1.25", features = ["derive"] }
+pollster = "1.0"
+raw-window-handle = "0.6"
+smithay-client-toolkit = { version = "0.21", default-features = false }
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wgpu = { version = "30", default-features = false, features = ["vulkan", "wgsl"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

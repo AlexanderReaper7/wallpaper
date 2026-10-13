@@ -1,8 +1,16 @@
 //! Animated wallpaper: one background layer surface per output, each drawn
 //! once per frame callback from that output, so every screen runs at its own
 //! refresh rate and a covered screen stops being asked for frames.
+//!
+//! The picture is a network of points drifting across a black background,
+//! with a white shimmering line between every two points that are close enough.
 
-use std::{f64::consts::TAU, ptr::NonNull, time::Instant};
+use std::{
+    f64::consts::TAU,
+    hash::{DefaultHasher, Hash, Hasher},
+    ptr::NonNull,
+    time::Instant,
+};
 
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
 use smithay_client_toolkit::{
@@ -27,29 +35,78 @@ use wayland_client::{
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
 
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Cube {
-    rot: [f32; 4],
-    place: [f32; 4],
-}
+// Tuning. Distances and speeds scale with the screen height, so the picture
+// looks the same on any resolution; widths are in physical pixels.
+
+/// Points per screen. They spread over the screen plus a margin just outside
+/// it, where they wrap around unseen.
+const POINTS: usize = 90;
+/// Two points closer than this are joined, as a fraction of the screen height.
+/// Lines fade out as they approach this length.
+const CONNECT_DISTANCE: f64 = 0.2;
+/// How far a point drifts per second, as a fraction of the screen height.
+/// 0.004 is about 9 px/s on a 2160-line screen.
+const SPEED: f64 = 0.004;
+/// Width of a line's solid core, in pixels.
+const LINE_WIDTH: f32 = 1.5;
+/// Diameter of a point's solid core, in pixels. It shows where lines meet and
+/// is no brighter than a line.
+const POINT_WIDTH: f32 = 4.0;
+/// Brightness of the glow right at the edge of the core, 0..1.
+const GLOW_STRENGTH: f32 = 0.12;
+/// How far the glow reaches past the core, in pixels. Each line is drawn as a
+/// quad this much wider on every side, so this sets most of the GPU cost.
+const GLOW_RADIUS: f32 = 40.0;
+/// Peak brightness of lines and points, 0..1.
+const BRIGHTNESS: f32 = 0.85;
+/// How much the shimmer dims a line at its darkest, 0..1.
+const SHIMMER_DEPTH: f32 = 0.5;
+/// Shimmer waves per second travelling along each line.
+const SHIMMER_SPEED: f64 = 0.08;
+/// Distance between shimmer waves along a line, in pixels.
+const SHIMMER_WAVELENGTH: f32 = 600.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Globals {
     resolution: [f32; 2],
+    glow_radius: f32,
+    glow_strength: f32,
+    shimmer_clock: f32,
+    shimmer_wavelength: f32,
     _pad: [f32; 2],
-    cubes: [Cube; 3],
 }
 
-/// Per cube: yaw speed, pitch speed, pitch phase (rad/s, rad/s, rad), offset,
-/// scale, brightness.
-const CUBES: [([f64; 3], [f32; 2], f32, f32); 3] = [
-    ([0.31, 0.23, 0.0], [0.0, 0.0], 0.9, 1.0),
-    ([-0.17, 0.29, 1.0], [-1.1, 0.35], 0.45, 0.6),
-    ([0.21, -0.13, 2.0], [1.2, -0.45], 0.35, 0.5),
-];
-const EDGES: u32 = 12 * CUBES.len() as u32;
+/// One line, or one point when `a == b`. Matches `Segment` in lines.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Segment {
+    a: [f32; 2],
+    b: [f32; 2],
+    /// (core half-width px, brightness, shimmer phase in turns, shimmer depth)
+    style: [f32; 4],
+}
+
+const MAX_SEGMENTS: usize = POINTS + POINTS * (POINTS - 1) / 2;
+
+/// A point drifting in a straight line across a field that wraps at its edges.
+/// The field is the screen grown by a margin wide enough that a point wraps
+/// only once nothing it is joined to can be seen.
+struct Point {
+    start: [f64; 2],
+    velocity: [f64; 2],
+    phase: f32,
+}
+
+/// splitmix64, enough to scatter the points without a dependency.
+fn random(state: &mut u64) -> f64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64
+}
 
 struct Gpu {
     instance: wgpu::Instance,
@@ -73,6 +130,13 @@ struct Screen {
     physical: (u32, u32),
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    points: Vec<Point>,
+    /// Wrapping field size and its margin past each screen edge, in pixels.
+    field: [f64; 2],
+    margin: f64,
+    /// Rebuilt every frame from the points, then copied into `instances`.
+    segments: Vec<Segment>,
+    instances: wgpu::Buffer,
     configured: bool,
     frames: u32,
 }
@@ -162,10 +226,11 @@ impl Gpu {
             bind_group_layouts: &[Some(&self.layout)],
             ..Default::default()
         });
-        let additive = wgpu::BlendComponent {
+        // Max, not add: see the top of lines.wgsl.
+        let brightest = wgpu::BlendComponent {
             src_factor: wgpu::BlendFactor::One,
             dst_factor: wgpu::BlendFactor::One,
-            operation: wgpu::BlendOperation::Add,
+            operation: wgpu::BlendOperation::Max,
         };
         let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None,
@@ -174,7 +239,11 @@ impl Gpu {
                 module: &self.shader,
                 entry_point: Some("vs"),
                 compilation_options: Default::default(),
-                buffers: &[],
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: size_of::<Segment>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4],
+                })],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &self.shader,
@@ -182,7 +251,7 @@ impl Gpu {
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState { color: additive, alpha: additive }),
+                    blend: Some(wgpu::BlendState { color: brightest, alpha: brightest }),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -246,6 +315,32 @@ impl App {
             layout: &self.gpu.layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() }],
         });
+        let instances = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (MAX_SEGMENTS * size_of::<Segment>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // A point wrapping at the field's edge is at least `margin` off screen,
+        // so its lines and their glow are too.
+        let height = physical.1 as f64;
+        let margin = CONNECT_DISTANCE * height + (GLOW_RADIUS + POINT_WIDTH) as f64;
+        let field = [physical.0 as f64 + 2.0 * margin, height + 2.0 * margin];
+        // Seeded by the output's name, so each screen has its own network and
+        // keeps it across restarts.
+        let mut hasher = DefaultHasher::new();
+        name.hash(&mut hasher);
+        let mut seed = hasher.finish();
+        let points = (0..POINTS)
+            .map(|_| {
+                let start = [random(&mut seed) * field[0], random(&mut seed) * field[1]];
+                let angle = random(&mut seed) * TAU;
+                let speed = SPEED * height * (0.5 + 0.5 * random(&mut seed));
+                let phase = random(&mut seed) as f32;
+                Point { start, velocity: [angle.cos() * speed, angle.sin() * speed], phase }
+            })
+            .collect();
 
         self.screens.push(Screen {
             surface,
@@ -256,6 +351,11 @@ impl App {
             physical,
             uniforms,
             bind_group,
+            points,
+            field,
+            margin,
+            segments: Vec::with_capacity(MAX_SEGMENTS),
+            instances,
             configured: false,
             frames: 0,
         });
@@ -265,20 +365,51 @@ impl App {
         let t = self.start.elapsed().as_secs_f64();
         let screen = &mut self.screens[index];
 
-        let mut globals = Globals {
+        // Positions and the shimmer clock are wrapped in f64, so they keep full
+        // precision however long the process runs.
+        let globals = Globals {
             resolution: [screen.physical.0 as f32, screen.physical.1 as f32],
+            glow_radius: GLOW_RADIUS,
+            glow_strength: GLOW_STRENGTH,
+            shimmer_clock: (SHIMMER_SPEED * t).fract() as f32,
+            shimmer_wavelength: SHIMMER_WAVELENGTH,
             _pad: [0.0; 2],
-            cubes: [Cube { rot: [0.0; 4], place: [0.0; 4] }; 3],
         };
-        for (out, (speed, offset, scale, brightness)) in globals.cubes.iter_mut().zip(CUBES) {
-            // Wrapped in f64 so the angles keep full precision however long
-            // the process runs.
-            let a = (speed[0] * t).rem_euclid(TAU);
-            let b = (speed[1] * t + speed[2]).rem_euclid(TAU);
-            out.rot = [a.cos() as f32, a.sin() as f32, b.cos() as f32, b.sin() as f32];
-            out.place = [offset[0], offset[1], scale, brightness];
-        }
         self.gpu.queue.write_buffer(&screen.uniforms, 0, bytemuck::bytes_of(&globals));
+
+        let positions: Vec<[f32; 2]> = screen
+            .points
+            .iter()
+            .map(|p| {
+                let at = |axis: usize| {
+                    ((p.start[axis] + p.velocity[axis] * t).rem_euclid(screen.field[axis]) - screen.margin) as f32
+                };
+                [at(0), at(1)]
+            })
+            .collect();
+        let reach = (CONNECT_DISTANCE * screen.physical.1 as f64) as f32;
+        screen.segments.clear();
+        for (i, &a) in positions.iter().enumerate() {
+            for (j, &b) in positions.iter().enumerate().skip(i + 1) {
+                let length = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+                if length >= reach {
+                    continue;
+                }
+                // Long lines are dim, so a line appears and disappears gradually.
+                let f = 1.0 - length / reach;
+                let fade = f * f * (3.0 - 2.0 * f);
+                let phase = (screen.points[i].phase + screen.points[j].phase).fract();
+                screen.segments.push(Segment {
+                    a,
+                    b,
+                    style: [LINE_WIDTH / 2.0, BRIGHTNESS * fade, phase, SHIMMER_DEPTH],
+                });
+            }
+        }
+        for &p in &positions {
+            screen.segments.push(Segment { a: p, b: p, style: [POINT_WIDTH / 2.0, BRIGHTNESS, 0.0, 0.0] });
+        }
+        self.gpu.queue.write_buffer(&screen.instances, 0, bytemuck::cast_slice(&screen.segments));
 
         let frame = match screen.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
@@ -311,7 +442,8 @@ impl App {
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &screen.bind_group, &[]);
-            pass.draw(0..4, 0..EDGES);
+            pass.set_vertex_buffer(0, screen.instances.slice(..));
+            pass.draw(0..4, 0..screen.segments.len() as u32);
         }
         self.gpu.queue.submit([encoder.finish()]);
 

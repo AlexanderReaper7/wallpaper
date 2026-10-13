@@ -1,0 +1,4 @@
+[build]
+# Local builds only. The Nix package takes the CPU name from nixcfg's
+# config.mine.cpu.arch instead, see ~/Projects/nixcfg/modules/nixos/cpu.nix.
+rustflags = ["-C", "target-cpu=native"]

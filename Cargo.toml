@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 bytemuck = { version = "1.25", features = ["derive"] }
+png = "0.18"
 pollster = "1.0"
 raw-window-handle = "0.6"
 smithay-client-toolkit = { version = "0.21", default-features = false }

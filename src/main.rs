@@ -8,6 +8,7 @@
 use std::{
     f64::consts::TAU,
     hash::{DefaultHasher, Hash, Hasher},
+    path::{Path, PathBuf},
     ptr::NonNull,
     time::Instant,
 };
@@ -130,6 +131,151 @@ fn random(state: &mut u64) -> f64 {
     (z >> 11) as f64 / (1u64 << 53) as f64
 }
 
+/// One screen's points, and the lines between them.
+struct Network {
+    points: Vec<Point>,
+    /// Wrapping field size and its margin past each screen edge, in pixels.
+    field: [f64; 2],
+    margin: f64,
+    height: f64,
+    /// Rebuilt every frame from the points.
+    segments: Vec<Segment>,
+}
+
+impl Network {
+    /// Seeded by the output's name, so each screen has its own network and
+    /// starts from the same picture on every run.
+    fn new(name: &str, physical: (u32, u32)) -> Network {
+        // A point wrapping at the field's edge is at least `margin` off screen,
+        // so its lines and their glow are too.
+        let height = physical.1 as f64;
+        let margin = CONNECT_DISTANCE * height + (GLOW_RADIUS + POINT_WIDTH) as f64;
+        let field = [physical.0 as f64 + 2.0 * margin, height + 2.0 * margin];
+        let mut hasher = DefaultHasher::new();
+        name.hash(&mut hasher);
+        let mut seed = hasher.finish();
+        // Mitchell's best candidate: of a few random spots, each point takes the
+        // one farthest from the points already placed. That gives an even
+        // spread without a grid's regularity.
+        let mut placed: Vec<[f64; 2]> = Vec::with_capacity(POINTS);
+        for _ in 0..POINTS {
+            let best = (0..16)
+                .map(|_| [random(&mut seed) * field[0], random(&mut seed) * field[1]])
+                .map(|c| {
+                    let nearest = placed
+                        .iter()
+                        .map(|p| wrap_delta(c[0] - p[0], field[0]).hypot(wrap_delta(c[1] - p[1], field[1])))
+                        .fold(f64::INFINITY, f64::min);
+                    (c, nearest)
+                })
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap()
+                .0;
+            placed.push(best);
+        }
+        let points = placed
+            .into_iter()
+            .map(|position| {
+                let angle = random(&mut seed) * TAU;
+                let speed = SPEED * height * (SLOWEST + (1.0 - SLOWEST) * random(&mut seed));
+                let preferred = [angle.cos() * speed, angle.sin() * speed];
+                let phase = random(&mut seed) as f32;
+                Point { position, velocity: preferred, preferred, phase }
+            })
+            .collect();
+
+        Network { points, field, margin, height, segments: Vec::with_capacity(MAX_SEGMENTS) }
+    }
+
+    /// Builds this frame's segments from the current positions, then moves the
+    /// points on by `dt` seconds.
+    fn frame(&mut self, dt: f64) -> &[Segment] {
+        let positions: Vec<[f32; 2]> = self
+            .points
+            .iter()
+            .map(|p| [(p.position[0] - self.margin) as f32, (p.position[1] - self.margin) as f32])
+            .collect();
+        // Per point, the sum of joined points' velocities weighted by line
+        // strength, and the sum of those weights.
+        let mut pull = vec![([0.0f64; 2], 0.0f64); positions.len()];
+        let reach = (CONNECT_DISTANCE * self.height) as f32;
+        self.segments.clear();
+        for (i, &a) in positions.iter().enumerate() {
+            for (j, &b) in positions.iter().enumerate().skip(i + 1) {
+                let length = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+                if length >= reach {
+                    continue;
+                }
+                // Long lines are dim, so a line appears and disappears gradually.
+                let f = 1.0 - length / reach;
+                let fade = f * f * (3.0 - 2.0 * f);
+                let phase = (self.points[i].phase + self.points[j].phase).fract();
+                let (vi, vj) = (self.points[i].velocity, self.points[j].velocity);
+                let w = fade as f64;
+                pull[i].0 = [pull[i].0[0] + w * vj[0], pull[i].0[1] + w * vj[1]];
+                pull[i].1 += w;
+                pull[j].0 = [pull[j].0[0] + w * vi[0], pull[j].0[1] + w * vi[1]];
+                pull[j].1 += w;
+                self.segments.push(Segment {
+                    a,
+                    b,
+                    style: [LINE_WIDTH / 2.0, BRIGHTNESS * fade, phase, SHIMMER_DEPTH],
+                });
+            }
+        }
+        for &p in &positions {
+            self.segments.push(Segment { a: p, b: p, style: [POINT_WIDTH / 2.0, BRIGHTNESS, 0.0, 0.0] });
+        }
+        // Each point eases toward a blend of its own preferred velocity and its
+        // neighbours' velocities, so joined points come to move together.
+        // On top of that, points too close together push apart, measured the
+        // short way around the wrapping field.
+        let field = self.field;
+        let spacing = SPACING * (field[0] * field[1] / POINTS as f64).sqrt();
+        let push_speed = SPEED * self.height;
+        let mut push = vec![[0.0f64; 2]; self.points.len()];
+        for i in 0..self.points.len() {
+            for j in i + 1..self.points.len() {
+                let (a, b) = (self.points[i].position, self.points[j].position);
+                let d = [wrap_delta(a[0] - b[0], field[0]), wrap_delta(a[1] - b[1], field[1])];
+                let length = d[0].hypot(d[1]);
+                if length >= spacing || length < 1e-6 {
+                    continue;
+                }
+                let strength = push_speed * (1.0 - length / spacing) / length;
+                for axis in 0..2 {
+                    push[i][axis] += d[axis] * strength;
+                    push[j][axis] -= d[axis] * strength;
+                }
+            }
+        }
+        let settle = 1.0 - (-dt / GROUP_SETTLE).exp();
+        for ((p, (sum, weight)), push) in self.points.iter_mut().zip(pull).zip(push) {
+            let norm = 1.0 + GROUP_PULL * weight;
+            for axis in 0..2 {
+                let target = (p.preferred[axis] + GROUP_PULL * sum[axis]) / norm + push[axis];
+                p.velocity[axis] += (target - p.velocity[axis]) * settle;
+                p.position[axis] = (p.position[axis] + p.velocity[axis] * dt).rem_euclid(self.field[axis]);
+            }
+        }
+
+        &self.segments
+    }
+}
+
+/// The shader's uniforms for a frame at `t` seconds. The shimmer clock is
+/// wrapped in f64, so it keeps full precision however long the process runs.
+fn globals(physical: (u32, u32), t: f64) -> Globals {
+    Globals {
+        resolution: [physical.0 as f32, physical.1 as f32],
+        glow_radius: GLOW_RADIUS,
+        glow_strength: GLOW_STRENGTH,
+        shimmer_clock: (SHIMMER_SPEED * t).fract() as f32,
+        shimmer_wavelength: SHIMMER_WAVELENGTH,
+        _pad: [0.0; 2],
+    }
+}
+
 struct Gpu {
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
@@ -141,6 +287,13 @@ struct Gpu {
     pipeline: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
 }
 
+/// The buffers one picture is drawn from.
+struct Target {
+    uniforms: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    instances: wgpu::Buffer,
+}
+
 struct Screen {
     // Declared first so it drops before the wl_surface it renders into.
     surface: wgpu::Surface<'static>,
@@ -150,15 +303,8 @@ struct Screen {
     name: String,
     /// Buffer size in physical pixels, taken from the output's current mode.
     physical: (u32, u32),
-    uniforms: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
-    points: Vec<Point>,
-    /// Wrapping field size and its margin past each screen edge, in pixels.
-    field: [f64; 2],
-    margin: f64,
-    /// Rebuilt every frame from the points, then copied into `instances`.
-    segments: Vec<Segment>,
-    instances: wgpu::Buffer,
+    target: Target,
+    network: Network,
     last_step: Option<Instant>,
     configured: bool,
     /// Refresh rate in Hz, to count frame callbacks that came late.
@@ -206,9 +352,22 @@ struct App {
     screens: Vec<Screen>,
     start: Instant,
     last_report: Instant,
+    /// Set by `--still <dir>`: write each screen's first frame there as
+    /// `<output>.png` and exit, instead of drawing on the screens.
+    still: Option<PathBuf>,
 }
 
 fn main() {
+    let mut args = std::env::args().skip(1);
+    let still = match (args.next().as_deref(), args.next(), args.next()) {
+        (None, ..) => None,
+        (Some("--still"), Some(dir), None) => Some(PathBuf::from(dir)),
+        _ => {
+            eprintln!("usage: wallpaper [--still <dir>]");
+            std::process::exit(2);
+        }
+    };
+
     let conn = Connection::connect_to_env().expect("no Wayland display");
     let (globals, mut queue) = registry_queue_init(&conn).expect("registry");
     let qh = queue.handle();
@@ -228,8 +387,16 @@ fn main() {
         screens: Vec::new(),
         start: Instant::now(),
         last_report: Instant::now(),
+        still,
     };
 
+    if app.still.is_some() {
+        // The first roundtrip announces the outputs, the second their modes
+        // and names, which is when new_output writes the stills.
+        queue.roundtrip(&mut app).expect("roundtrip");
+        queue.roundtrip(&mut app).expect("roundtrip");
+        return;
+    }
     loop {
         queue.blocking_dispatch(&mut app).expect("dispatch");
     }
@@ -321,6 +488,110 @@ impl Gpu {
         self.pipeline = Some((format, pipeline));
         &self.pipeline.as_ref().unwrap().1
     }
+
+    fn target(&self) -> Target {
+        let uniforms = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: size_of::<Globals>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() }],
+        });
+        let instances = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (MAX_SEGMENTS * size_of::<Segment>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Target { uniforms, bind_group, instances }
+    }
+
+    /// Records drawing `segments` onto a black `view` into `encoder`.
+    fn render(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &Target,
+        view: &wgpu::TextureView,
+        format: wgpu::TextureFormat,
+        globals: &Globals,
+        segments: &[Segment],
+    ) {
+        self.queue.write_buffer(&target.uniforms, 0, bytemuck::bytes_of(globals));
+        self.queue.write_buffer(&target.instances, 0, bytemuck::cast_slice(segments));
+        let pipeline = self.pipeline(format);
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &target.bind_group, &[]);
+        pass.set_vertex_buffer(0, target.instances.slice(..));
+        pass.draw(0..4, 0..segments.len() as u32);
+    }
+
+    /// Renders the first frame `name`'s screen shows and writes it as a PNG,
+    /// in the sRGB format the live surfaces use.
+    fn write_still(&mut self, name: &str, physical: (u32, u32), path: &Path) {
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let size = wgpu::Extent3d { width: physical.0, height: physical.1, depth_or_array_layers: 1 };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let row = (physical.0 * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: row as u64 * physical.1 as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let target = self.target();
+        let mut network = Network::new(name, physical);
+        let view = texture.create_view(&Default::default());
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        self.render(&mut encoder, &target, &view, format, &globals(physical, 0.0), network.frame(0.0));
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: None },
+            },
+            size,
+        );
+        self.queue.submit([encoder.finish()]);
+        readback.slice(..).map_async(wgpu::MapMode::Read, |result| result.expect("map readback"));
+        self.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+
+        let mapped = readback.slice(..).get_mapped_range().expect("mapped range");
+        let mut pixels = Vec::with_capacity((physical.0 * 4 * physical.1) as usize);
+        for line in mapped.chunks(row as usize) {
+            pixels.extend_from_slice(&line[..(physical.0 * 4) as usize]);
+        }
+        let file = std::io::BufWriter::new(std::fs::File::create(path).expect("create still"));
+        let mut png = png::Encoder::new(file, physical.0, physical.1);
+        png.set_color(png::ColorType::Rgba);
+        png.set_depth(png::BitDepth::Eight);
+        png.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+        png.write_header().and_then(|mut w| w.write_image_data(&pixels)).expect("write still");
+        eprintln!("{name}: wrote {}", path.display());
+    }
 }
 
 impl App {
@@ -358,64 +629,8 @@ impl App {
         }
         .expect("wgpu surface");
 
-        let uniforms = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: size_of::<Globals>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let bind_group = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.gpu.layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() }],
-        });
-        let instances = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: (MAX_SEGMENTS * size_of::<Segment>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // A point wrapping at the field's edge is at least `margin` off screen,
-        // so its lines and their glow are too.
-        let height = physical.1 as f64;
-        let margin = CONNECT_DISTANCE * height + (GLOW_RADIUS + POINT_WIDTH) as f64;
-        let field = [physical.0 as f64 + 2.0 * margin, height + 2.0 * margin];
-        // Seeded by the output's name, so each screen has its own network and
-        // keeps it across restarts.
-        let mut hasher = DefaultHasher::new();
-        name.hash(&mut hasher);
-        let mut seed = hasher.finish();
-        // Mitchell's best candidate: of a few random spots, each point takes the
-        // one farthest from the points already placed. That gives an even
-        // spread without a grid's regularity.
-        let mut placed: Vec<[f64; 2]> = Vec::with_capacity(POINTS);
-        for _ in 0..POINTS {
-            let best = (0..16)
-                .map(|_| [random(&mut seed) * field[0], random(&mut seed) * field[1]])
-                .map(|c| {
-                    let nearest = placed
-                        .iter()
-                        .map(|p| wrap_delta(c[0] - p[0], field[0]).hypot(wrap_delta(c[1] - p[1], field[1])))
-                        .fold(f64::INFINITY, f64::min);
-                    (c, nearest)
-                })
-                .max_by(|a, b| a.1.total_cmp(&b.1))
-                .unwrap()
-                .0;
-            placed.push(best);
-        }
-        let points = placed
-            .into_iter()
-            .map(|position| {
-                let angle = random(&mut seed) * TAU;
-                let speed = SPEED * height * (SLOWEST + (1.0 - SLOWEST) * random(&mut seed));
-                let preferred = [angle.cos() * speed, angle.sin() * speed];
-                let phase = random(&mut seed) as f32;
-                Point { position, velocity: preferred, preferred, phase }
-            })
-            .collect();
-
+        let target = self.gpu.target();
+        let network = Network::new(&name, physical);
         self.screens.push(Screen {
             surface,
             viewport,
@@ -423,13 +638,8 @@ impl App {
             output,
             name,
             physical,
-            uniforms,
-            bind_group,
-            points,
-            field,
-            margin,
-            segments: Vec::with_capacity(MAX_SEGMENTS),
-            instances,
+            target,
+            network,
             last_step: None,
             configured: false,
             refresh: mode.refresh_rate as f64 / 1000.0,
@@ -451,89 +661,6 @@ impl App {
         let dt = dt.min(0.1);
         screen.last_step = Some(now);
 
-        // Positions and the shimmer clock are wrapped in f64, so they keep full
-        // precision however long the process runs.
-        let globals = Globals {
-            resolution: [screen.physical.0 as f32, screen.physical.1 as f32],
-            glow_radius: GLOW_RADIUS,
-            glow_strength: GLOW_STRENGTH,
-            shimmer_clock: (SHIMMER_SPEED * t).fract() as f32,
-            shimmer_wavelength: SHIMMER_WAVELENGTH,
-            _pad: [0.0; 2],
-        };
-        self.gpu.queue.write_buffer(&screen.uniforms, 0, bytemuck::bytes_of(&globals));
-
-        let positions: Vec<[f32; 2]> = screen
-            .points
-            .iter()
-            .map(|p| [(p.position[0] - screen.margin) as f32, (p.position[1] - screen.margin) as f32])
-            .collect();
-        // Per point, the sum of joined points' velocities weighted by line
-        // strength, and the sum of those weights.
-        let mut pull = vec![([0.0f64; 2], 0.0f64); positions.len()];
-        let reach = (CONNECT_DISTANCE * screen.physical.1 as f64) as f32;
-        screen.segments.clear();
-        for (i, &a) in positions.iter().enumerate() {
-            for (j, &b) in positions.iter().enumerate().skip(i + 1) {
-                let length = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
-                if length >= reach {
-                    continue;
-                }
-                // Long lines are dim, so a line appears and disappears gradually.
-                let f = 1.0 - length / reach;
-                let fade = f * f * (3.0 - 2.0 * f);
-                let phase = (screen.points[i].phase + screen.points[j].phase).fract();
-                let (vi, vj) = (screen.points[i].velocity, screen.points[j].velocity);
-                let w = fade as f64;
-                pull[i].0 = [pull[i].0[0] + w * vj[0], pull[i].0[1] + w * vj[1]];
-                pull[i].1 += w;
-                pull[j].0 = [pull[j].0[0] + w * vi[0], pull[j].0[1] + w * vi[1]];
-                pull[j].1 += w;
-                screen.segments.push(Segment {
-                    a,
-                    b,
-                    style: [LINE_WIDTH / 2.0, BRIGHTNESS * fade, phase, SHIMMER_DEPTH],
-                });
-            }
-        }
-        for &p in &positions {
-            screen.segments.push(Segment { a: p, b: p, style: [POINT_WIDTH / 2.0, BRIGHTNESS, 0.0, 0.0] });
-        }
-        self.gpu.queue.write_buffer(&screen.instances, 0, bytemuck::cast_slice(&screen.segments));
-
-        // Each point eases toward a blend of its own preferred velocity and its
-        // neighbours' velocities, so joined points come to move together.
-        // On top of that, points too close together push apart, measured the
-        // short way around the wrapping field.
-        let field = screen.field;
-        let spacing = SPACING * (field[0] * field[1] / POINTS as f64).sqrt();
-        let push_speed = SPEED * screen.physical.1 as f64;
-        let mut push = vec![[0.0f64; 2]; screen.points.len()];
-        for i in 0..screen.points.len() {
-            for j in i + 1..screen.points.len() {
-                let (a, b) = (screen.points[i].position, screen.points[j].position);
-                let d = [wrap_delta(a[0] - b[0], field[0]), wrap_delta(a[1] - b[1], field[1])];
-                let length = d[0].hypot(d[1]);
-                if length >= spacing || length < 1e-6 {
-                    continue;
-                }
-                let strength = push_speed * (1.0 - length / spacing) / length;
-                for axis in 0..2 {
-                    push[i][axis] += d[axis] * strength;
-                    push[j][axis] -= d[axis] * strength;
-                }
-            }
-        }
-        let settle = 1.0 - (-dt / GROUP_SETTLE).exp();
-        for ((p, (sum, weight)), push) in screen.points.iter_mut().zip(pull).zip(push) {
-            let norm = 1.0 + GROUP_PULL * weight;
-            for axis in 0..2 {
-                let target = (p.preferred[axis] + GROUP_PULL * sum[axis]) / norm + push[axis];
-                p.velocity[axis] += (target - p.velocity[axis]) * settle;
-                p.position[axis] = (p.position[axis] + p.velocity[axis] * dt).rem_euclid(screen.field[axis]);
-            }
-        }
-
         let waiting = Instant::now();
         let frame = match screen.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
@@ -546,30 +673,15 @@ impl App {
         };
         screen.stats.texture_wait.add(waiting.elapsed().as_secs_f64());
         let view = frame.texture.create_view(&Default::default());
-        let format = frame.texture.format();
-        let pipeline = self.gpu.pipeline(format).clone();
-        let screen = &mut self.screens[index];
-
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &screen.bind_group, &[]);
-            pass.set_vertex_buffer(0, screen.instances.slice(..));
-            pass.draw(0..4, 0..screen.segments.len() as u32);
-        }
+        self.gpu.render(
+            &mut encoder,
+            &screen.target,
+            &view,
+            frame.texture.format(),
+            &globals(screen.physical, t),
+            screen.network.frame(dt),
+        );
         self.gpu.queue.submit([encoder.finish()]);
 
         // The callback has to be on the surface before present commits it.
@@ -620,6 +732,14 @@ impl OutputHandler for App {
         &mut self.outputs
     }
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: WlOutput) {
+        if let Some(dir) = &self.still {
+            let Some(info) = self.outputs.info(&output) else { return };
+            let Some(mode) = info.modes.iter().find(|m| m.current) else { return };
+            let name = info.name.clone().unwrap_or_default();
+            let path = dir.join(format!("{name}.png"));
+            self.gpu.write_still(&name, (mode.dimensions.0 as u32, mode.dimensions.1 as u32), &path);
+            return;
+        }
         self.add_screen(qh, output);
     }
     fn update_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: WlOutput) {

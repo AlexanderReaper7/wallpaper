@@ -17,4 +17,4 @@ Run, with the Vulkan loader on the library path:
 LD_LIBRARY_PATH=$(nix build --no-link --print-out-paths nixpkgs#vulkan-loader)/lib ./target/release/wallpaper
 ```
 
-Every 5 seconds it logs each screen's frame rate to stderr.
+Every 5 seconds it logs to stderr, per screen: the frame rate, how many frame callbacks came more than 1.5 refresh periods after the previous one, and the time spent in a draw call and waiting for a surface texture inside it.

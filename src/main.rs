@@ -44,9 +44,24 @@ const POINTS: usize = 90;
 /// Two points closer than this are joined, as a fraction of the screen height.
 /// Lines fade out as they approach this length.
 const CONNECT_DISTANCE: f64 = 0.2;
-/// How far a point drifts per second, as a fraction of the screen height.
-/// 0.004 is about 9 px/s on a 2160-line screen.
+/// How fast the fastest point wants to drift, as a fraction of the screen
+/// height per second. 0.004 is about 9 px/s on a 2160-line screen.
 const SPEED: f64 = 0.004;
+/// How fast the slowest point wants to drift, as a fraction of SPEED. Each
+/// point gets its own speed, spread evenly between this and SPEED.
+const SLOWEST: f64 = 0.15;
+/// How strongly joined points pull each other's velocity together, so a group
+/// drifts as one and groups move at different speeds. 0 lets every point keep
+/// its own velocity. At 2, one full-strength line weighs twice a point's own
+/// wish. Weaker, longer lines pull less.
+const GROUP_PULL: f64 = 2.0;
+/// Seconds a point takes to settle most of the way (63%) into its group's motion.
+const GROUP_SETTLE: f64 = 4.0;
+/// Two points closer than this push apart, so the points stay evenly spread
+/// instead of clumping. A fraction of the even spacing, the side of the square
+/// each point would get if the field were shared out equally. The push is at
+/// most SPEED, when two points sit on top of each other.
+const SPACING: f64 = 0.7;
 /// Width of a line's solid core, in pixels.
 const LINE_WIDTH: f32 = 1.5;
 /// Diameter of a point's solid core, in pixels. It shows where lines meet and
@@ -89,13 +104,20 @@ struct Segment {
 
 const MAX_SEGMENTS: usize = POINTS + POINTS * (POINTS - 1) / 2;
 
-/// A point drifting in a straight line across a field that wraps at its edges.
-/// The field is the screen grown by a margin wide enough that a point wraps
-/// only once nothing it is joined to can be seen.
+/// A point drifting across a field that wraps at its edges. The field is the
+/// screen grown by a margin wide enough that a point wraps only once nothing it
+/// is joined to can be seen. Position and velocity are in pixels.
 struct Point {
-    start: [f64; 2],
+    position: [f64; 2],
     velocity: [f64; 2],
+    /// The velocity the point drifts at when nothing is joined to it.
+    preferred: [f64; 2],
     phase: f32,
+}
+
+/// `d` folded onto the shortest way around a wrapping axis of length `size`.
+fn wrap_delta(d: f64, size: f64) -> f64 {
+    d - size * (d / size).round()
 }
 
 /// splitmix64, enough to scatter the points without a dependency.
@@ -137,8 +159,40 @@ struct Screen {
     /// Rebuilt every frame from the points, then copied into `instances`.
     segments: Vec<Segment>,
     instances: wgpu::Buffer,
+    last_step: Option<Instant>,
     configured: bool,
+    /// Refresh rate in Hz, to count frame callbacks that came late.
+    refresh: f64,
     frames: u32,
+    stats: FrameStats,
+}
+
+/// Where a screen's frames spent their time since the last report.
+#[derive(Default)]
+struct FrameStats {
+    /// Frame callbacks that came more than one and a half refresh periods
+    /// after the previous one.
+    late: u32,
+    /// Whole draw call, and the part of it inside get_current_texture.
+    draw: Timing,
+    texture_wait: Timing,
+}
+
+#[derive(Default)]
+struct Timing {
+    total: f64,
+    max: f64,
+}
+
+impl Timing {
+    fn add(&mut self, seconds: f64) {
+        self.total += seconds;
+        self.max = self.max.max(seconds);
+    }
+
+    fn show(&self, frames: u32) -> String {
+        format!("mean {:.2} max {:.2} ms", self.total / frames.max(1) as f64 * 1e3, self.max * 1e3)
+    }
 }
 
 struct App {
@@ -332,13 +386,33 @@ impl App {
         let mut hasher = DefaultHasher::new();
         name.hash(&mut hasher);
         let mut seed = hasher.finish();
-        let points = (0..POINTS)
-            .map(|_| {
-                let start = [random(&mut seed) * field[0], random(&mut seed) * field[1]];
+        // Mitchell's best candidate: of a few random spots, each point takes the
+        // one farthest from the points already placed. That gives an even
+        // spread without a grid's regularity.
+        let mut placed: Vec<[f64; 2]> = Vec::with_capacity(POINTS);
+        for _ in 0..POINTS {
+            let best = (0..16)
+                .map(|_| [random(&mut seed) * field[0], random(&mut seed) * field[1]])
+                .map(|c| {
+                    let nearest = placed
+                        .iter()
+                        .map(|p| wrap_delta(c[0] - p[0], field[0]).hypot(wrap_delta(c[1] - p[1], field[1])))
+                        .fold(f64::INFINITY, f64::min);
+                    (c, nearest)
+                })
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap()
+                .0;
+            placed.push(best);
+        }
+        let points = placed
+            .into_iter()
+            .map(|position| {
                 let angle = random(&mut seed) * TAU;
-                let speed = SPEED * height * (0.5 + 0.5 * random(&mut seed));
+                let speed = SPEED * height * (SLOWEST + (1.0 - SLOWEST) * random(&mut seed));
+                let preferred = [angle.cos() * speed, angle.sin() * speed];
                 let phase = random(&mut seed) as f32;
-                Point { start, velocity: [angle.cos() * speed, angle.sin() * speed], phase }
+                Point { position, velocity: preferred, preferred, phase }
             })
             .collect();
 
@@ -356,14 +430,26 @@ impl App {
             margin,
             segments: Vec::with_capacity(MAX_SEGMENTS),
             instances,
+            last_step: None,
             configured: false,
+            refresh: mode.refresh_rate as f64 / 1000.0,
             frames: 0,
+            stats: FrameStats::default(),
         });
     }
 
     fn draw(&mut self, qh: &QueueHandle<Self>, index: usize) {
-        let t = self.start.elapsed().as_secs_f64();
+        let now = Instant::now();
+        let t = (now - self.start).as_secs_f64();
         let screen = &mut self.screens[index];
+        // Capped, so a screen that was covered and drawn once a second does not
+        // jump when it shows again.
+        let dt = screen.last_step.map_or(0.0, |last| (now - last).as_secs_f64());
+        if dt > 1.5 / screen.refresh && dt < 0.5 {
+            screen.stats.late += 1;
+        }
+        let dt = dt.min(0.1);
+        screen.last_step = Some(now);
 
         // Positions and the shimmer clock are wrapped in f64, so they keep full
         // precision however long the process runs.
@@ -380,13 +466,11 @@ impl App {
         let positions: Vec<[f32; 2]> = screen
             .points
             .iter()
-            .map(|p| {
-                let at = |axis: usize| {
-                    ((p.start[axis] + p.velocity[axis] * t).rem_euclid(screen.field[axis]) - screen.margin) as f32
-                };
-                [at(0), at(1)]
-            })
+            .map(|p| [(p.position[0] - screen.margin) as f32, (p.position[1] - screen.margin) as f32])
             .collect();
+        // Per point, the sum of joined points' velocities weighted by line
+        // strength, and the sum of those weights.
+        let mut pull = vec![([0.0f64; 2], 0.0f64); positions.len()];
         let reach = (CONNECT_DISTANCE * screen.physical.1 as f64) as f32;
         screen.segments.clear();
         for (i, &a) in positions.iter().enumerate() {
@@ -399,6 +483,12 @@ impl App {
                 let f = 1.0 - length / reach;
                 let fade = f * f * (3.0 - 2.0 * f);
                 let phase = (screen.points[i].phase + screen.points[j].phase).fract();
+                let (vi, vj) = (screen.points[i].velocity, screen.points[j].velocity);
+                let w = fade as f64;
+                pull[i].0 = [pull[i].0[0] + w * vj[0], pull[i].0[1] + w * vj[1]];
+                pull[i].1 += w;
+                pull[j].0 = [pull[j].0[0] + w * vi[0], pull[j].0[1] + w * vi[1]];
+                pull[j].1 += w;
                 screen.segments.push(Segment {
                     a,
                     b,
@@ -411,6 +501,40 @@ impl App {
         }
         self.gpu.queue.write_buffer(&screen.instances, 0, bytemuck::cast_slice(&screen.segments));
 
+        // Each point eases toward a blend of its own preferred velocity and its
+        // neighbours' velocities, so joined points come to move together.
+        // On top of that, points too close together push apart, measured the
+        // short way around the wrapping field.
+        let field = screen.field;
+        let spacing = SPACING * (field[0] * field[1] / POINTS as f64).sqrt();
+        let push_speed = SPEED * screen.physical.1 as f64;
+        let mut push = vec![[0.0f64; 2]; screen.points.len()];
+        for i in 0..screen.points.len() {
+            for j in i + 1..screen.points.len() {
+                let (a, b) = (screen.points[i].position, screen.points[j].position);
+                let d = [wrap_delta(a[0] - b[0], field[0]), wrap_delta(a[1] - b[1], field[1])];
+                let length = d[0].hypot(d[1]);
+                if length >= spacing || length < 1e-6 {
+                    continue;
+                }
+                let strength = push_speed * (1.0 - length / spacing) / length;
+                for axis in 0..2 {
+                    push[i][axis] += d[axis] * strength;
+                    push[j][axis] -= d[axis] * strength;
+                }
+            }
+        }
+        let settle = 1.0 - (-dt / GROUP_SETTLE).exp();
+        for ((p, (sum, weight)), push) in screen.points.iter_mut().zip(pull).zip(push) {
+            let norm = 1.0 + GROUP_PULL * weight;
+            for axis in 0..2 {
+                let target = (p.preferred[axis] + GROUP_PULL * sum[axis]) / norm + push[axis];
+                p.velocity[axis] += (target - p.velocity[axis]) * settle;
+                p.position[axis] = (p.position[axis] + p.velocity[axis] * dt).rem_euclid(screen.field[axis]);
+            }
+        }
+
+        let waiting = Instant::now();
         let frame = match screen.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
                 frame
@@ -420,6 +544,7 @@ impl App {
                 return;
             }
         };
+        screen.stats.texture_wait.add(waiting.elapsed().as_secs_f64());
         let view = frame.texture.create_view(&Default::default());
         let format = frame.texture.format();
         let pipeline = self.gpu.pipeline(format).clone();
@@ -452,13 +577,25 @@ impl App {
         wl_surface.frame(qh, FrameCallbackData(wl_surface.clone()));
         self.gpu.queue.present(frame);
         screen.frames += 1;
+        screen.stats.draw.add(now.elapsed().as_secs_f64());
 
         let since = self.last_report.elapsed().as_secs_f64();
         if since >= 5.0 {
             let rates: Vec<String> = self
                 .screens
                 .iter_mut()
-                .map(|s| format!("{} {:.1} fps", s.name, std::mem::take(&mut s.frames) as f64 / since))
+                .map(|s| {
+                    let frames = std::mem::take(&mut s.frames);
+                    let stats = std::mem::take(&mut s.stats);
+                    format!(
+                        "{} {:.1} fps ({} late, draw {}, texture wait {})",
+                        s.name,
+                        frames as f64 / since,
+                        stats.late,
+                        stats.draw.show(frames),
+                        stats.texture_wait.show(frames)
+                    )
+                })
                 .collect();
             eprintln!("{}", rates.join(", "));
             self.last_report = Instant::now();

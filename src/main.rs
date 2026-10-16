@@ -13,7 +13,6 @@ use std::{
     time::Instant,
 };
 
-
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData},
@@ -158,23 +157,31 @@ struct PresentClock {
     commits: u64,
     /// The latest commit reported as shown, and the time it was.
     shown: Option<(u64, f64)>,
-    /// Seconds between vblanks.
+    /// Seconds between vblanks. Infinite for an output that reports a refresh
+    /// rate of 0.
     period: f64,
+    /// The latest time `predict` returned.
+    predicted: f64,
 }
 
 impl PresentClock {
     fn new(period: f64) -> PresentClock {
-        PresentClock { commits: 0, shown: None, period }
+        PresentClock { commits: 0, shown: None, period, predicted: f64::NEG_INFINITY }
     }
 
     /// The time the next commit is expected on the screen, given the time `now`.
     /// Never earlier than `now`, which keeps a screen that stopped getting
-    /// feedback, a covered one, from falling behind.
-    fn predict(&self, now: f64) -> f64 {
-        match self.shown {
-            Some((commit, time)) => (time + (self.commits - commit) as f64 * self.period).max(now),
+    /// feedback, a covered one, from falling behind, and never earlier than the
+    /// previous prediction, so a re-anchored grid cannot step the animation back.
+    /// Without a finite period it is `now`.
+    fn predict(&mut self, now: f64) -> f64 {
+        let grid = match self.shown {
+            Some((commit, time)) => time + (self.commits - commit) as f64 * self.period,
             None => now,
-        }
+        };
+        let t = if grid.is_finite() { grid.max(now) } else { now }.max(self.predicted);
+        self.predicted = t;
+        t
     }
 
     /// Records a commit and returns its number, for the feedback request.
@@ -1026,5 +1033,34 @@ mod tests {
         clock.shown(commit, 10.0, None);
         // A covered screen drawn a second later is not predicted in the past.
         assert_eq!(clock.predict(11.0), 11.0);
+    }
+
+    /// An output with a refresh rate of 0 and feedback without a period has no
+    /// grid to predict on.
+    #[test]
+    fn prediction_without_a_period_is_now() {
+        let mut clock = PresentClock::new(1000.0 / 0.0);
+        let commit = clock.commit();
+        clock.shown(commit, 10.0, None);
+        let _ = clock.commit();
+        assert_eq!(clock.predict(10.5), 10.5);
+    }
+
+    /// Feedback that re-anchors the grid earlier than an earlier prediction,
+    /// here a shorter period, does not move time back.
+    #[test]
+    fn prediction_never_steps_back() {
+        let period = 1.0 / 60.0;
+        let mut clock = PresentClock::new(period);
+        let first = clock.commit();
+        clock.shown(first, 10.0, None);
+        clock.predict(10.001);
+        let second = clock.commit();
+        let before = clock.predict(10.002);
+        assert!((before - (10.0 + 2.0 * period)).abs() < 1e-12);
+        let _third = clock.commit();
+        // The grid now puts the next commit at 10 + 1.5 periods.
+        clock.shown(second, 10.0 + period, Some(period / 4.0));
+        assert_eq!(clock.predict(10.003), before);
     }
 }

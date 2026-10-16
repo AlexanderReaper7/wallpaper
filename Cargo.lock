@@ -766,6 +766,7 @@ dependencies = [
  "png",
  "pollster",
  "raw-window-handle",
+ "rustix",
  "smithay-client-toolkit",
  "wayland-backend",
  "wayland-client",

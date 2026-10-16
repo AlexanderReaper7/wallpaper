@@ -8,6 +8,7 @@ bytemuck = { version = "1.25", features = ["derive"] }
 png = "0.18"
 pollster = "1.0"
 raw-window-handle = "0.6"
+rustix = { version = "1.1.5", features = ["time"] }
 smithay-client-toolkit = { version = "0.21", default-features = false }
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-client = "0.31"

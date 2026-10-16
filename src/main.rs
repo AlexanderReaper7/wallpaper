@@ -13,6 +13,7 @@ use std::{
     time::Instant,
 };
 
+
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData},
@@ -31,10 +32,19 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_output::WlOutput, wl_surface::WlSurface},
+    protocol::{
+        wl_output::{Transform, WlOutput},
+        wl_surface::WlSurface,
+    },
     Connection, Proxy, QueueHandle,
 };
-use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
+use wayland_protocols::wp::{
+    presentation_time::client::{
+        wp_presentation::{self, WpPresentation},
+        wp_presentation_feedback::{self, WpPresentationFeedback},
+    },
+    viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
+};
 
 // Tuning. Distances and speeds scale with the screen height, so the picture
 // looks the same on any resolution; widths are in physical pixels.
@@ -119,6 +129,70 @@ struct Point {
 /// `d` folded onto the shortest way around a wrapping axis of length `size`.
 fn wrap_delta(d: f64, size: f64) -> f64 {
     d - size * (d / size).round()
+}
+
+/// The buffer size in pixels for an output with mode `dimensions`. The mode is
+/// the panel's own orientation; the compositor applies the output's transform
+/// afterwards, so the surface is drawn in the rotated orientation and a 90° or
+/// 270° transform swaps the sides.
+fn buffer_size(dimensions: (i32, i32), transform: Transform) -> (u32, u32) {
+    let (w, h) = (dimensions.0 as u32, dimensions.1 as u32);
+    match transform {
+        Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270 => (h, w),
+        _ => (w, h),
+    }
+}
+
+/// Seconds on CLOCK_MONOTONIC, the clock `Instant` reads and the one the
+/// compositor stamps presentation feedback with.
+fn monotonic() -> f64 {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    t.tv_sec as f64 + t.tv_nsec as f64 * 1e-9
+}
+
+/// Predicts when the next commit reaches the screen, from when an earlier one
+/// did. A frame callback arrives some time before the vblank its frame is shown
+/// at, and by a varying amount, so the animation steps by vblanks instead.
+struct PresentClock {
+    /// Commits made so far, which is also the number the next commit gets.
+    commits: u64,
+    /// The latest commit reported as shown, and the time it was.
+    shown: Option<(u64, f64)>,
+    /// Seconds between vblanks.
+    period: f64,
+}
+
+impl PresentClock {
+    fn new(period: f64) -> PresentClock {
+        PresentClock { commits: 0, shown: None, period }
+    }
+
+    /// The time the next commit is expected on the screen, given the time `now`.
+    /// Never earlier than `now`, which keeps a screen that stopped getting
+    /// feedback, a covered one, from falling behind.
+    fn predict(&self, now: f64) -> f64 {
+        match self.shown {
+            Some((commit, time)) => (time + (self.commits - commit) as f64 * self.period).max(now),
+            None => now,
+        }
+    }
+
+    /// Records a commit and returns its number, for the feedback request.
+    fn commit(&mut self) -> u64 {
+        self.commits += 1;
+        self.commits - 1
+    }
+
+    /// Records that `commit` was shown at `time`. `refresh` is the output's
+    /// current vblank period in seconds, if the compositor knows it.
+    fn shown(&mut self, commit: u64, time: f64, refresh: Option<f64>) {
+        if self.shown.is_none_or(|(latest, _)| commit > latest) {
+            self.shown = Some((commit, time));
+        }
+        if let Some(refresh) = refresh {
+            self.period = refresh;
+        }
+    }
 }
 
 /// splitmix64, enough to scatter the points without a dependency.
@@ -301,11 +375,15 @@ struct Screen {
     layer: LayerSurface,
     output: WlOutput,
     name: String,
-    /// Buffer size in physical pixels, taken from the output's current mode.
+    /// Buffer size in physical pixels, from the output's current mode and transform.
     physical: (u32, u32),
     target: Target,
     network: Network,
-    last_step: Option<Instant>,
+    /// When the previous frame callback arrived, for counting late ones.
+    last_callback: Option<Instant>,
+    /// The time the animation was last stepped to, in `monotonic` seconds.
+    content_time: Option<f64>,
+    present: PresentClock,
     configured: bool,
     /// Refresh rate in Hz, to count frame callbacks that came late.
     refresh: f64,
@@ -350,8 +428,12 @@ struct App {
     conn: Connection,
     gpu: Gpu,
     screens: Vec<Screen>,
-    start: Instant,
+    /// `monotonic` seconds when the process started.
+    start: f64,
     last_report: Instant,
+    /// Set when the compositor offers wp_presentation on CLOCK_MONOTONIC.
+    presentation: Option<WpPresentation>,
+    presentation_clock: Option<u32>,
     /// Set by `--still <dir>`: write each screen's first frame there as
     /// `<output>.png` and exit, instead of drawing on the screens.
     still: Option<PathBuf>,
@@ -375,6 +457,7 @@ fn main() {
     let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor");
     let layer_shell = LayerShell::bind(&globals, &qh).expect("zwlr_layer_shell_v1");
     let viewporter: WpViewporter = globals.bind(&qh, 1..=1, Ignore).expect("wp_viewporter");
+    let presentation: Option<WpPresentation> = globals.bind(&qh, 1..=1, Presentation).ok();
 
     let mut app = App {
         registry: RegistryState::new(&globals),
@@ -385,10 +468,26 @@ fn main() {
         conn: conn.clone(),
         gpu: pollster::block_on(Gpu::new()),
         screens: Vec::new(),
-        start: Instant::now(),
+        start: monotonic(),
         last_report: Instant::now(),
+        presentation,
+        presentation_clock: None,
         still,
     };
+
+    // The clock_id event follows the bind.
+    queue.roundtrip(&mut app).expect("roundtrip");
+    if app.presentation.is_some() {
+        let monotonic_id = app.presentation_clock.and_then(|id| rustix::time::ClockId::try_from(id as i32).ok());
+        if monotonic_id == Some(rustix::time::ClockId::Monotonic) {
+            eprintln!("timing frames by wp_presentation feedback");
+        } else {
+            eprintln!("wp_presentation clock {:?} is not CLOCK_MONOTONIC, timing frames by their callbacks", app.presentation_clock);
+            app.presentation = None;
+        }
+    } else {
+        eprintln!("no wp_presentation, timing frames by their callbacks");
+    }
 
     if app.still.is_some() {
         // The first roundtrip announces the outputs, the second their modes
@@ -598,9 +697,15 @@ impl App {
     fn add_screen(&mut self, qh: &QueueHandle<Self>, output: WlOutput) {
         let Some(info) = self.outputs.info(&output) else { return };
         let Some(mode) = info.modes.iter().find(|m| m.current) else { return };
-        let physical = (mode.dimensions.0 as u32, mode.dimensions.1 as u32);
+        let physical = buffer_size(mode.dimensions, info.transform);
         let name = info.name.clone().unwrap_or_default();
-        eprintln!("{name}: {}x{} @ {:.3} Hz", physical.0, physical.1, mode.refresh_rate as f64 / 1000.0);
+        eprintln!(
+            "{name}: {}x{} @ {:.3} Hz, transform {:?}",
+            physical.0,
+            physical.1,
+            mode.refresh_rate as f64 / 1000.0,
+            info.transform
+        );
 
         let wl_surface = self.compositor.create_surface(qh);
         let viewport = self.viewporter.get_viewport(&wl_surface, qh, Ignore);
@@ -640,7 +745,9 @@ impl App {
             physical,
             target,
             network,
-            last_step: None,
+            last_callback: None,
+            content_time: None,
+            present: PresentClock::new(1000.0 / mode.refresh_rate as f64),
             configured: false,
             refresh: mode.refresh_rate as f64 / 1000.0,
             frames: 0,
@@ -650,16 +757,21 @@ impl App {
 
     fn draw(&mut self, qh: &QueueHandle<Self>, index: usize) {
         let now = Instant::now();
-        let t = (now - self.start).as_secs_f64();
         let screen = &mut self.screens[index];
-        // Capped, so a screen that was covered and drawn once a second does not
-        // jump when it shows again.
-        let dt = screen.last_step.map_or(0.0, |last| (now - last).as_secs_f64());
-        if dt > 1.5 / screen.refresh && dt < 0.5 {
+        let callback_gap = screen.last_callback.map_or(0.0, |last| (now - last).as_secs_f64());
+        if callback_gap > 1.5 / screen.refresh && callback_gap < 0.5 {
             screen.stats.late += 1;
         }
-        let dt = dt.min(0.1);
-        screen.last_step = Some(now);
+        screen.last_callback = Some(now);
+
+        // The animation shows the moment the frame will be on the screen, which
+        // is what the eye compares frames by. Without presentation feedback that
+        // is the time of the callback. The step is capped, so a screen that was
+        // covered and drawn once a second does not jump when it shows again.
+        let t = screen.present.predict(monotonic());
+        let dt = screen.content_time.map_or(0.0, |last| (t - last).clamp(0.0, 0.1));
+        screen.content_time = Some(t);
+        let t = t - self.start;
 
         let waiting = Instant::now();
         let frame = match screen.surface.get_current_texture() {
@@ -687,6 +799,10 @@ impl App {
         // The callback has to be on the surface before present commits it.
         let wl_surface = screen.layer.wl_surface();
         wl_surface.frame(qh, FrameCallbackData(wl_surface.clone()));
+        let commit = screen.present.commit();
+        if let Some(presentation) = &self.presentation {
+            presentation.feedback(wl_surface, qh, Feedback { surface: wl_surface.clone(), commit });
+        }
         self.gpu.queue.present(frame);
         screen.frames += 1;
         screen.stats.draw.add(now.elapsed().as_secs_f64());
@@ -737,7 +853,7 @@ impl OutputHandler for App {
             let Some(mode) = info.modes.iter().find(|m| m.current) else { return };
             let name = info.name.clone().unwrap_or_default();
             let path = dir.join(format!("{name}.png"));
-            self.gpu.write_still(&name, (mode.dimensions.0 as u32, mode.dimensions.1 as u32), &path);
+            self.gpu.write_still(&name, buffer_size(mode.dimensions, info.transform), &path);
             return;
         }
         self.add_screen(qh, output);
@@ -820,9 +936,95 @@ impl ProvidesRegistryState for App {
 delegate_registry!(App);
 delegate_dispatch2!(App);
 
+/// User data for wp_presentation, which reports the clock its timestamps use.
+struct Presentation;
+
+impl Dispatch2<WpPresentation, App> for Presentation {
+    fn event(&self, app: &mut App, _: &WpPresentation, event: wp_presentation::Event, _: &Connection, _: &QueueHandle<App>) {
+        if let wp_presentation::Event::ClockId { clk_id } = event {
+            app.presentation_clock = Some(clk_id);
+        }
+    }
+}
+
+/// User data for one commit's presentation feedback.
+struct Feedback {
+    surface: WlSurface,
+    commit: u64,
+}
+
+impl Dispatch2<WpPresentationFeedback, App> for Feedback {
+    fn event(&self, app: &mut App, _: &WpPresentationFeedback, event: wp_presentation_feedback::Event, _: &Connection, _: &QueueHandle<App>) {
+        let wp_presentation_feedback::Event::Presented { tv_sec_hi, tv_sec_lo, tv_nsec, refresh, .. } = event else {
+            return;
+        };
+        let Some(screen) = app.screens.iter_mut().find(|s| s.layer.wl_surface() == &self.surface) else { return };
+        let seconds = (u64::from(tv_sec_hi) << 32 | u64::from(tv_sec_lo)) as f64;
+        // A refresh of 0 means the compositor does not know the period, as with
+        // variable refresh rate.
+        let refresh = (refresh > 0).then(|| refresh as f64 * 1e-9);
+        screen.present.shown(self.commit, seconds + tv_nsec as f64 * 1e-9, refresh);
+    }
+}
+
 /// User data for the viewporter objects, which send no events.
 struct Ignore;
 
 impl<I: Proxy> Dispatch2<I, App> for Ignore {
     fn event(&self, _: &mut App, _: &I, _: I::Event, _: &Connection, _: &QueueHandle<App>) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quarter_turns_swap_the_buffer_sides() {
+        let mode = (3840, 2160);
+        for (transform, expected) in [
+            (Transform::Normal, (3840, 2160)),
+            (Transform::_180, (3840, 2160)),
+            (Transform::Flipped, (3840, 2160)),
+            (Transform::Flipped180, (3840, 2160)),
+            (Transform::_90, (2160, 3840)),
+            (Transform::_270, (2160, 3840)),
+            (Transform::Flipped90, (2160, 3840)),
+            (Transform::Flipped270, (2160, 3840)),
+        ] {
+            assert_eq!(buffer_size(mode, transform), expected, "{transform:?}");
+        }
+    }
+
+    /// Frame callbacks arrive at uneven moments, vblanks do not: the predicted
+    /// times must sit on the vblank grid however the draws are timed.
+    #[test]
+    fn prediction_follows_vblanks_not_draw_times() {
+        let period = 1.0 / 120.0;
+        let mut clock = PresentClock::new(period);
+        // Nothing shown yet: the draw time stands in.
+        assert_eq!(clock.predict(5.0), 5.0);
+        let first = clock.commit();
+        clock.shown(first, 10.0, None);
+        // The next commit is predicted one period on, however late it is drawn.
+        assert!((clock.predict(10.0) - (10.0 + period)).abs() < 1e-12);
+        let second = clock.commit();
+        // The one after is drawn before the second's feedback arrived: two
+        // periods past the first, on the same grid.
+        assert!((clock.predict(10.0) - (10.0 + 2.0 * period)).abs() < 1e-12);
+        let _third = clock.commit();
+        // Feedback for the second re-anchors the grid, and a stale report for
+        // the first does not move it back.
+        clock.shown(second, 10.0 + period + 0.0004, Some(period));
+        clock.shown(first, 10.0, None);
+        assert!((clock.predict(10.0) - (10.0 + 3.0 * period + 0.0004)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn prediction_never_lags_behind_now() {
+        let mut clock = PresentClock::new(1.0 / 120.0);
+        let commit = clock.commit();
+        clock.shown(commit, 10.0, None);
+        // A covered screen drawn a second later is not predicted in the past.
+        assert_eq!(clock.predict(11.0), 11.0);
+    }
 }

@@ -6,6 +6,7 @@
 //! with a white shimmering line between every two points that are close enough.
 
 use std::{
+    error::Error,
     f64::consts::TAU,
     hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
@@ -444,6 +445,8 @@ struct App {
     /// Set by `--still <dir>`: write each screen's first frame there as
     /// `<output>.png` and exit, instead of drawing on the screens.
     still: Option<PathBuf>,
+    /// Set when a still could not be written, so the process exits with 1.
+    still_failed: bool,
 }
 
 fn main() {
@@ -480,6 +483,7 @@ fn main() {
         presentation,
         presentation_clock: None,
         still,
+        still_failed: false,
     };
 
     // The clock_id event follows the bind.
@@ -501,6 +505,9 @@ fn main() {
         // and names, which is when new_output writes the stills.
         queue.roundtrip(&mut app).expect("roundtrip");
         queue.roundtrip(&mut app).expect("roundtrip");
+        if app.still_failed {
+            std::process::exit(1);
+        }
         return;
     }
     loop {
@@ -647,7 +654,7 @@ impl Gpu {
 
     /// Renders the first frame `name`'s screen shows and writes it as a PNG,
     /// in the sRGB format the live surfaces use.
-    fn write_still(&mut self, name: &str, physical: (u32, u32), path: &Path) {
+    fn write_still(&mut self, name: &str, physical: (u32, u32), path: &Path) -> Result<(), Box<dyn Error>> {
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let size = wgpu::Extent3d { width: physical.0, height: physical.1, depth_or_array_layers: 1 };
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -690,14 +697,25 @@ impl Gpu {
         for line in mapped.chunks(row as usize) {
             pixels.extend_from_slice(&line[..(physical.0 * 4) as usize]);
         }
-        let file = std::io::BufWriter::new(std::fs::File::create(path).expect("create still"));
-        let mut png = png::Encoder::new(file, physical.0, physical.1);
-        png.set_color(png::ColorType::Rgba);
-        png.set_depth(png::BitDepth::Eight);
-        png.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
-        png.write_header().and_then(|mut w| w.write_image_data(&pixels)).expect("write still");
+        save_png(path, physical, &pixels)?;
         eprintln!("{name}: wrote {}", path.display());
+        Ok(())
     }
+}
+
+/// Writes RGBA8 `pixels` to `path` as an sRGB PNG, creating its directory,
+/// which on a fresh home does not exist yet.
+fn save_png(path: &Path, size: (u32, u32), pixels: &[u8]) -> Result<(), Box<dyn Error>> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let mut png = png::Encoder::new(file, size.0, size.1);
+    png.set_color(png::ColorType::Rgba);
+    png.set_depth(png::BitDepth::Eight);
+    png.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+    png.write_header()?.write_image_data(pixels)?;
+    Ok(())
 }
 
 impl App {
@@ -860,7 +878,10 @@ impl OutputHandler for App {
             let Some(mode) = info.modes.iter().find(|m| m.current) else { return };
             let name = info.name.clone().unwrap_or_default();
             let path = dir.join(format!("{name}.png"));
-            self.gpu.write_still(&name, buffer_size(mode.dimensions, info.transform), &path);
+            if let Err(e) = self.gpu.write_still(&name, buffer_size(mode.dimensions, info.transform), &path) {
+                eprintln!("{name}: cannot write {}: {e}", path.display());
+                self.still_failed = true;
+            }
             return;
         }
         self.add_screen(qh, output);
@@ -1062,5 +1083,39 @@ mod tests {
         // The grid now puts the next commit at 10 + 1.5 periods.
         clock.shown(second, 10.0 + period, Some(period / 4.0));
         assert_eq!(clock.predict(10.003), before);
+    }
+
+    /// A fresh directory under the system temp dir, unique to this test.
+    fn scratch(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("wallpaper-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn still_creates_its_missing_directory() {
+        let root = scratch("missing-dir");
+        let path = root.join("share/wallpaper/DP-1.png");
+        let pixels = [255, 0, 0, 255, 0, 0, 255, 255];
+        save_png(&path, (2, 1), &pixels).expect("save");
+
+        let mut reader = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&path).unwrap()))
+            .read_info()
+            .unwrap();
+        let mut decoded = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut decoded).unwrap();
+        assert_eq!((info.width, info.height), (2, 1));
+        assert_eq!(&decoded[..info.buffer_size()], &pixels);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn unwritable_still_is_an_error_not_a_panic() {
+        let root = scratch("unwritable");
+        std::fs::create_dir_all(&root).unwrap();
+        // A file where the directory should be: create_dir_all cannot succeed.
+        std::fs::write(root.join("wallpaper"), b"").unwrap();
+        assert!(save_png(&root.join("wallpaper/DP-1.png"), (1, 1), &[0; 4]).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

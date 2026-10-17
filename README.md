@@ -23,7 +23,7 @@ The animation steps by when each frame reaches the screen, not by when its frame
 
 Every 5 seconds it logs to stderr, per screen: the frame rate, how many frame callbacks came more than 1.5 refresh periods after the previous one, and the time spent in a draw call and waiting for a surface texture inside it.
 
-`--still <dir>` writes the first frame each screen shows to `<dir>/<output>.png` and exits without drawing on the screens. The COSMIC background points at these files in `~/.local/share/wallpaper/`, through `backgrounds` and `output.<name>` in `~/.config/cosmic/com.system76.CosmicBackground/v1/`, so the screen looks the same while the live wallpaper is down, and the live one starts from that exact picture. Rerun it after changing a constant:
+`--still <dir>` writes the first frame each screen shows to `<dir>/<output>.png`, creating `<dir>` if it is missing, and exits without drawing on the screens, with status 1 if a still could not be written. The COSMIC background points at these files in `~/.local/share/wallpaper/`, through `backgrounds` and `output.<name>` in `~/.config/cosmic/com.system76.CosmicBackground/v1/`, so the screen looks the same while the live wallpaper is down, and the live one starts from that exact picture. Rerun it after changing a constant:
 
 ```bash
 LD_LIBRARY_PATH=$(nix build --no-link --print-out-paths nixpkgs#vulkan-loader)/lib ./target/release/wallpaper --still ~/.local/share/wallpaper

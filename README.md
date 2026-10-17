@@ -11,6 +11,8 @@ nix shell nixpkgs#pkg-config nixpkgs#wayland.dev --command bash -c \
   'PKG_CONFIG_PATH=$(nix eval --raw nixpkgs#wayland.dev)/lib/pkgconfig cargo build --release'
 ```
 
+`nix/wallpaper.nix` is the Nix package. nixcfg builds it with its own `mine.cpu.arch` in place of `.cargo/config.toml`'s `native`, and runs it as a COSMIC user service that writes the stills first.
+
 Run, with the Vulkan loader on the library path:
 
 ```bash
